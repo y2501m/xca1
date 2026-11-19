@@ -1,0 +1,98 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      # 1. ソースコード取得
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # 2. MinGW64環境構築
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-glfw
+            mingw-w64-x86_64-libzip
+            mingw-w64-x86_64-ntldd
+
+      # 3. CMake構成
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+
+      # 4. ビルド
+      - name: Build
+        run: |
+          cmake --build build --parallel 4
+          test -f build/ZipAnalysis.exe
+
+      # 5. DLLを含めて配布用フォルダ作成
+      - name: Collect Runtime DLLs
+        run: |
+          mkdir -p dist
+          cp build/ZipAnalysis.exe dist/
+
+          ntldd -R build/ZipAnalysis.exe > dependencies.txt
+          cat dependencies.txt
+
+          if grep -qi "not found" dependencies.txt; then
+            echo "Unresolved DLL dependencies"
+            exit 1
+          fi
+
+          grep -oEi '[A-Za-z0-9_.+-]+\.dll' \
+            dependencies.txt | sort -fu > dlls.txt
+
+          while IFS= read -r dll; do
+            if [ -f "$MINGW_PREFIX/bin/$dll" ]; then
+              cp -v "$MINGW_PREFIX/bin/$dll" dist/
+            fi
+          done < dlls.txt
+
+          ls -la dist/
+
+      # 6. ZIP圧縮
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $zip = "ZIP File Password Analysis-$tag-win64.zip"
+
+          Compress-Archive `
+            -Path "dist\*" `
+            -DestinationPath $zip `
+            -Force
+
+      # 7. GitHub Releasesへ公開
+      - name: Publish Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ZIP File Password Analysis-*-win64.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true

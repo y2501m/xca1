@@ -39,6 +39,11 @@ find_package(libzip REQUIRED)
 # 実行ファイル
 add_executable(${PROJECT_NAME} ${SOURCES})
 
+# 実行ファイル名を変更
+set_target_properties(${PROJECT_NAME} PROPERTIES
+    OUTPUT_NAME "ZipAnalysis"
+)
+
 # ライブラリーリンク
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ${GLFW3_LIB}
