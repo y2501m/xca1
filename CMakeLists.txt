@@ -59,7 +59,7 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 # glfw3.dllのコピー
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        /mingw64/bin/glfw3.dll
+        C:/msys64/mingw64/bin/glfw3.dll
         $<TARGET_FILE_DIR:${PROJECT_NAME}>
     COMMENT "Copying glfw3.dll to output directory..."
 )
