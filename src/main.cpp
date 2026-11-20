@@ -146,8 +146,15 @@ void drawFileDialog() {
     }
     ImGui::SameLine();
 
+    // ダイアログのサイズを指定
+    const ImVec2 dialogSize(800.0f, 500.0f);
+
     // ダイアログ描画
-    if (ImGuiFileDialog::Instance()->Display("FileOpenDialog")) {
+    if (ImGuiFileDialog::Instance()->Display(
+            "FileOpenDialog",
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize,
+            dialogSize,
+            dialogSize)) {
         if (ImGuiFileDialog::Instance()->IsOk()) {
             // OKが押された場合のみパスをセット
             selectedFile = ImGuiFileDialog::Instance()->GetFilePathName();
