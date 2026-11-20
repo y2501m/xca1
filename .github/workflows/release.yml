@@ -51,42 +51,57 @@ jobs:
           cmake --build build --parallel 4
           test -f build/ZipAnalysis.exe
 
-
       # 5. DLLを含めて配布用フォルダ作成
       - name: Collect Runtime DLLs
         run: |
+          set -e
+
           mkdir -p dist
           cp build/ZipAnalysis.exe dist/
 
-          # DLLの依存関係を取得
+          # 再帰的に依存DLLを取得
           ntldd -R build/ZipAnalysis.exe > dependencies.txt
-          cat dependencies.txt
-
-          # Windows API Setを除いて未解決DLLを検出
-          unresolved=$(
-            grep -Ei '=>[[:space:]]*not found' dependencies.txt |
-            grep -Evi '^[[:space:]]*(api-ms-win-|ext-ms-win-)' ||
-            true
-          )
-
-          if [ -n "$unresolved" ]; then
-            echo "Unresolved DLL dependencies:"
-            echo "$unresolved"
-            exit 1
-          fi
 
           # DLL名を抽出
           grep -oEi '[A-Za-z0-9_.+-]+\.dll' \
-            dependencies.txt | sort -fu > dlls.txt
+            dependencies.txt | sort -fu > dlls.txt || true
 
-          # MinGW64のDLLをコピー
+          # MinGW64のDLLだけをコピー
           while IFS= read -r dll; do
             if [ -f "$MINGW_PREFIX/bin/$dll" ]; then
               cp -v "$MINGW_PREFIX/bin/$dll" dist/
             fi
           done < dlls.txt
 
-          # 配布ファイル一覧
+          # 配布対象の直接依存関係だけをチェック
+          unresolved=0
+
+          for file in dist/*.exe dist/*.dll; do
+            [ -f "$file" ] || continue
+
+            echo "Checking: $file"
+
+            # -Rを付けずに直接依存のみ確認
+            ntldd "$file" > direct-deps.txt
+
+            missing=$(
+              grep -Ei '=>[[:space:]]*not found' direct-deps.txt |
+              grep -Evi '^[[:space:]]*(api-ms-|ext-ms-)' ||
+              true
+            )
+
+            if [ -n "$missing" ]; then
+              echo "Missing dependencies in $file:"
+              echo "$missing"
+              unresolved=1
+            fi
+          done
+
+          if [ "$unresolved" -ne 0 ]; then
+            echo "Unresolved direct dependencies"
+            exit 1
+          fi
+
           echo "Distribution files:"
           ls -la dist/
 
