@@ -24,20 +24,20 @@ jobs:
         with:
           submodules: recursive
 
-      # 2. MinGW64環境構築
+      # 2. UCRT64環境構築
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-glfw
-            mingw-w64-x86_64-libzip
-            mingw-w64-x86_64-ntldd
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-glfw
+            mingw-w64-ucrt-x86_64-libzip
+            mingw-w64-ucrt-x86_64-ntldd
 
       # 3. CMake構成
       - name: Configure CMake

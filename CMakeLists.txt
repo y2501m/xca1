@@ -22,41 +22,32 @@ set(SOURCES
     external/ImGuiFileDialog/ImGuiFileDialog.cpp
 )
 
-# インクルードディレクトリ
-include_directories(
-    external/glad/include
-    external/glfw/include
-    /mingw64/include
-    external/imgui
-    external/imgui/backends
-    external/ImGuiFileDialog
-)
-
-# パッケージ
-find_library(GLFW3_LIB NAMES glfw3 glfw PATHS /mingw64/lib)
-find_package(libzip REQUIRED)
+# パッケージ検出
+find_package(glfw3 CONFIG REQUIRED)
+find_package(libzip CONFIG REQUIRED)
+find_package(OpenGL REQUIRED)
 
 # 実行ファイル
 add_executable(${PROJECT_NAME} ${SOURCES})
 
-# 実行ファイル名を変更
+# 実行ファイル名・Windowsアプリ設定
 set_target_properties(${PROJECT_NAME} PROPERTIES
     OUTPUT_NAME "ZipAnalysis"
+    WIN32_EXECUTABLE TRUE
 )
 
-# ライブラリーリンク
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    ${GLFW3_LIB}
-    ${OPENGL_gl_LIBRARY}
-    zip
-    -lgdi32
-)
+# インクルードディレクトリ
 target_include_directories(${PROJECT_NAME} PRIVATE
     external/glad/include
     external/imgui
     external/imgui/backends
     external/ImGuiFileDialog
 )
-set_target_properties(${PROJECT_NAME} PROPERTIES
-    WIN32_EXECUTABLE TRUE
+
+# ライブラリーリンク
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    glfw
+    libzip::zip
+    OpenGL::GL
+    gdi32
 )
