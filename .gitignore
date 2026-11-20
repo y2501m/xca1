@@ -1,9 +1,15 @@
-# VSCode
 .vscode/
 
-# OS
-.DS_Store
-
-
 /build/
-/external/
+
+# external配下は原則除外
+/external/*
+
+# GLAD
+!/external/glad/
+
+# ImGui
+!/external/imgui/
+
+# ImGuiFileDialog
+!/external/ImGuiFileDialog/

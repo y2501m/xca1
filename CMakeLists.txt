@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 # プロジェクト名
-project(xca1 LANGUAGES CXX)
+project(xca1 LANGUAGES C CXX)
 
 # C++の標準を設定
 set(CMAKE_CXX_STANDARD 17)
@@ -59,12 +59,4 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 set_target_properties(${PROJECT_NAME} PROPERTIES
     WIN32_EXECUTABLE TRUE
-)
-
-# glfw3.dllのコピー
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        C:/msys64/mingw64/bin/glfw3.dll
-        $<TARGET_FILE_DIR:${PROJECT_NAME}>
-    COMMENT "Copying glfw3.dll to output directory..."
 )
