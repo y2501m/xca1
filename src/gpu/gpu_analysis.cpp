@@ -49,13 +49,23 @@ constexpr ClUInt kProgramBuildLog = 0x1183;
 constexpr ClMemFlags kReadOnly = 1ull << 2;
 constexpr ClMemFlags kReadWrite = 1ull << 0;
 constexpr ClBool kBlocking = 1;
-constexpr std::size_t kBatchSize = 131072;
-constexpr ClUInt kMaxHits = 4096;
+// Larger batches reduce per-dispatch synchronization overhead. Keep the
+// 1-byte-filter hit buffer comfortably above the expected (batch / 256) count.
+constexpr std::size_t kBatchSize = 524288;
+constexpr ClUInt kMaxHits = 8192;
 constexpr int kMaxGpuSuffix = 8; // 91^8 fits in uint64_t; 91^16 does not.
 
 // Kept as source in the binary: no runtime .cl file or SDK is needed.
-// A one-byte header check is a filter only; host verifies every hit via libzip.
+// GPU checks ZipCrypto header, optional DEFLATE structure, or STORE CRC32.
+// CPU/libzip still validates all remaining candidates in full.
 constexpr char kKernelSource[] = R"OPENCL(
+#ifndef CHARSET_SIZE
+#error CHARSET_SIZE must be passed at build time
+#endif
+#ifndef LOW_DIGITS
+#error LOW_DIGITS must be passed at build time
+#endif
+
 uint crc_byte(uint key, uchar b, __constant const uint* table) {
     return (key >> 8) ^ table[(key ^ (uint)b) & 255u];
 }
@@ -67,32 +77,51 @@ void update_keys(uint* k0, uint* k1, uint* k2,
 }
 __kernel void search_zipcrypto(
     __global const uchar* alphabet,
-    uint alphabetSize,
-    __global const uchar* prefix,
-    uint prefixLen,
     uint suffixLen,
+    uint prefixK0,
+    uint prefixK1,
+    uint prefixK2,
     __constant const uchar* encryptedHeader,
     uint checkByte,
     __constant const uint* crcTable,
-    ulong start,
+    uint lowStart,
+    uint highIndex,
     __global uint* hitOffsets,
     volatile __global uint* hitCount,
-    uint hitCapacity)
+    uint hitCapacity,
+    __constant const uchar* encryptedDeflatePrefix,
+    uint enableDeflatePrefilter,
+    __global const uchar* encryptedStoreData,
+    uint storeDataSize,
+    uint storeExpectedCrc32,
+    uint enableStoreCrcPrefilter)
 {
     const uint gid = (uint)get_global_id(0);
-    ulong index = start + (ulong)gid;
-    uchar password[16];
-    for (uint i = 0; i < prefixLen; ++i)
-        password[i] = prefix[i];
-    for (int i = (int)suffixLen - 1; i >= 0; --i) {
-        password[prefixLen + (uint)i] = alphabet[(uint)(index % alphabetSize)];
-        index /= (ulong)alphabetSize;
+    uchar password[8];
+
+    // Split suffix indexes into two 32-bit portions. The host guarantees
+    // that one batch never crosses the low-part radix boundary. Hence this
+    // avoids any 64-bit division/modulo per candidate, even for 8 characters.
+    const uint lowDigits = min(suffixLen, (uint)LOW_DIGITS);
+    const uint highDigits = suffixLen - lowDigits;
+    uint low = lowStart + gid;
+    uint high = highIndex;
+    for (int i = (int)suffixLen - 1; i >= (int)highDigits; --i) {
+        password[(uint)i] = alphabet[low % (uint)CHARSET_SIZE];
+        low /= (uint)CHARSET_SIZE;
     }
-    uint k0 = 0x12345678u;
-    uint k1 = 0x23456789u;
-    uint k2 = 0x34567890u;
-    for (uint i = 0; i < prefixLen + suffixLen; ++i)
+    for (int i = (int)highDigits - 1; i >= 0; --i) {
+        password[(uint)i] = alphabet[high % (uint)CHARSET_SIZE];
+        high /= (uint)CHARSET_SIZE;
+    }
+
+    // Prefix key state was computed once on the host, not once per candidate.
+    uint k0 = prefixK0;
+    uint k1 = prefixK1;
+    uint k2 = prefixK2;
+    for (uint i = 0; i < suffixLen; ++i)
         update_keys(&k0, &k1, &k2, password[i], crcTable);
+
     uchar plain = 0;
     for (uint j = 0; j < 12; ++j) {
         uint tmp = (k2 | 2u) & 65535u;
@@ -101,12 +130,95 @@ __kernel void search_zipcrypto(
         update_keys(&k0, &k1, &k2, plain, crcTable);
     }
     if ((uint)plain == checkByte) {
+        // hitCount[1] is the number passing the original ZipCrypto check.
+        // hitCount[0] is the number forwarded to CPU after optional filtering.
+        if (enableDeflatePrefilter != 0u || enableStoreCrcPrefilter != 0u)
+            atomic_inc(hitCount + 1);
+        if (enableStoreCrcPrefilter != 0u) {
+            // ZipCrypto state is now positioned at the first STORE payload
+            // byte. STORE means plaintext == uncompressed bytes: compute the
+            // standard ZIP CRC32 on the *entire* plaintext, not ciphertext.
+            uint crc = 0xffffffffu;
+            for (uint i = 0u; i < storeDataSize; ++i) {
+                uint t = (k2 | 2u) & 65535u;
+                uchar plainByte = encryptedStoreData[i] ^
+                    (uchar)((t * (t ^ 1u)) >> 8);
+                update_keys(&k0, &k1, &k2, plainByte, crcTable);
+                crc = crc_byte(crc, plainByte, crcTable);
+            }
+            if ((crc ^ 0xffffffffu) != storeExpectedCrc32) return;
+        } else if (enableDeflatePrefilter != 0u) {
+            uint t = (k2 | 2u) & 65535u;
+            uchar first = encryptedDeflatePrefix[0] ^
+                (uchar)((t * (t ^ 1u)) >> 8);
+            uint blockType = ((uint)first >> 1) & 3u;
+
+            // RFC 1951, section 3.2.3: BTYPE=11 is reserved/invalid.
+            if (blockType == 3u) return;
+            // RFC 1951, section 3.2.7: HLIT encodes 257..286 (0..29).
+            if (blockType == 2u && ((uint)first >> 3) > 29u) return;
+            // BTYPE=00: at the next byte boundary, NLEN must complement LEN.
+            // Only decrypt these extra four bytes when needed.
+            if (blockType == 0u) {
+                update_keys(&k0, &k1, &k2, first, crcTable);
+                uint len = 0u;
+                uint nlen = 0u;
+                for (uint i = 1u; i < 5u; ++i) {
+                    t = (k2 | 2u) & 65535u;
+                    uchar b = encryptedDeflatePrefix[i] ^
+                        (uchar)((t * (t ^ 1u)) >> 8);
+                    if (i <= 2u) len |= ((uint)b) << (8u * (i - 1u));
+                    else nlen |= ((uint)b) << (8u * (i - 3u));
+                    update_keys(&k0, &k1, &k2, b, crcTable);
+                }
+                if ((len ^ nlen) != 65535u) return;
+            }
+        }
         uint position = atomic_inc(hitCount);
         if (position < hitCapacity)
             hitOffsets[position] = gid;
     }
 }
 )OPENCL";
+
+
+// Shared CRC table for the GPU kernel and host-side prefix state.
+const std::array<std::uint32_t, 256>& crcTable() {
+    static const std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> values{};
+        for (std::uint32_t i = 0; i < 256; ++i) {
+            std::uint32_t c = i;
+            for (int bit = 0; bit < 8; ++bit)
+                c = (c >> 1) ^ ((c & 1u) ? 0xedb88320u : 0u);
+            values[i] = c;
+        }
+        return values;
+    }();
+    return table;
+}
+
+// Largest number of candidate digits whose radix space fits in uint32_t.
+int maxLowDigits(std::size_t alphabetSize) {
+    std::uint64_t span = 1;
+    int digits = 0;
+    while (digits < kMaxGpuSuffix &&
+           span <= std::numeric_limits<std::uint32_t>::max() / alphabetSize) {
+        span *= alphabetSize;
+        ++digits;
+    }
+    return digits;
+}
+
+std::array<std::uint32_t, 3> keysForPrefix(const std::string& prefix) {
+    std::array<std::uint32_t, 3> k{{0x12345678u, 0x23456789u, 0x34567890u}};
+    const auto& table = crcTable();
+    for (unsigned char b : prefix) {
+        k[0] = (k[0] >> 8) ^ table[(k[0] ^ b) & 255u];
+        k[1] = (k[1] + (k[0] & 255u)) * 134775813u + 1u;
+        k[2] = (k[2] >> 8) ^ table[(k[2] ^ (k[1] >> 24)) & 255u];
+    }
+    return k;
+}
 
 struct OpenCl {
     using GetPlatforms = ClInt(CL_API*)(ClUInt, ClPlatformId*, ClUInt*);
@@ -164,7 +276,7 @@ struct OpenCl {
     ClCommandQueue queue = nullptr;
     ClProgram program = nullptr;
     ClKernel kernel = nullptr;
-    std::array<ClMem, 6> buffers{};
+    std::array<ClMem, 7> buffers{};
     ClDeviceId device = nullptr;
     std::string deviceName;
 
@@ -192,7 +304,7 @@ struct OpenCl {
 #endif
         return address != nullptr;
     }
-    bool init(std::string& reason) {
+    bool init(ClUInt alphabetSize, int lowDigits, std::string& reason) {
 #if defined(_WIN32)
         library = LoadLibraryExW(L"OpenCL.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
 #else
@@ -265,7 +377,11 @@ struct OpenCl {
         const char* src = kKernelSource;
         program = createProgram(context, 1, &src, nullptr, &err);
         if (!program || err != kSuccess) { reason = "clCreateProgramWithSource failed."; return false; }
-        err = buildProgram(program, 1, &device, "-cl-std=CL1.2", nullptr, nullptr);
+        // Constant radix lets the OpenCL compiler strength-reduce / and %.
+        const std::string buildOptions = "-cl-std=CL1.2 -DCHARSET_SIZE=" +
+                                         std::to_string(alphabetSize) +
+                                         " -DLOW_DIGITS=" + std::to_string(lowDigits);
+        err = buildProgram(program, 1, &device, buildOptions.c_str(), nullptr, nullptr);
         if (err != kSuccess) {
             std::string log = buildLog();
             reason = "OpenCL ZipCrypto kernel build failed" +
@@ -295,37 +411,45 @@ struct OpenCl {
     }
     bool createBuffers(const ZipCryptoInput& input,
                        const std::string& alphabet, std::string& reason) {
-        const std::array<std::size_t, 6> sizes{{
-            alphabet.size(), 16, input.encryptedHeader.size(),
-            256 * sizeof(std::uint32_t), kMaxHits * sizeof(std::uint32_t), sizeof(ClUInt)
+        const std::array<std::size_t, 7> sizes{{
+            alphabet.size(), input.encryptedHeader.size(),
+            256 * sizeof(std::uint32_t), kMaxHits * sizeof(std::uint32_t),
+            2 * sizeof(ClUInt), input.encryptedDeflatePrefix.size(),
+            std::max<std::size_t>(1, input.encryptedStoreData.size())
         }};
         for (std::size_t i = 0; i < buffers.size(); ++i) {
             ClInt err = 0;
-            buffers[i] = createBuffer(context, i >= 4 ? kReadWrite : kReadOnly,
+            buffers[i] = createBuffer(context, (i == 3 || i == 4) ? kReadWrite : kReadOnly,
                                       sizes[i], nullptr, &err);
             if (!buffers[i] || err != kSuccess) {
                 reason = "clCreateBuffer failed for buffer " + std::to_string(i);
                 return false;
             }
         }
-        std::array<std::uint32_t, 256> crcTable{};
-        for (std::uint32_t i = 0; i < 256; ++i) {
-            std::uint32_t c = i;
-            for (int bit = 0; bit < 8; ++bit)
-                c = (c >> 1) ^ ((c & 1u) ? 0xedb88320u : 0u);
-            crcTable[i] = c;
-        }
+        const auto& table = crcTable();
         if (!write(0, alphabet.data(), alphabet.size()) ||
-            !write(2, input.encryptedHeader.data(), input.encryptedHeader.size()) ||
-            !write(3, crcTable.data(), crcTable.size() * sizeof(crcTable[0]))) {
+            !write(1, input.encryptedHeader.data(), input.encryptedHeader.size()) ||
+            !write(2, table.data(), table.size() * sizeof(table[0])) ||
+            !write(5, input.encryptedDeflatePrefix.data(),
+                   input.encryptedDeflatePrefix.size())) {
             reason = "Failed to upload ZipCrypto data to GPU."; return false;
         }
-        const ClUInt base = static_cast<ClUInt>(alphabet.size());
+        if (input.storeCrcPrefilterEnabled &&
+            !write(6, input.encryptedStoreData.data(), input.encryptedStoreData.size())) {
+            reason = "Failed to upload encrypted STORE payload to GPU.";
+            return false;
+        }
         const ClUInt check = input.checkByte;
         const ClUInt capacity = kMaxHits;
-        if (!argMem(0, 0) || !arg(1, base) || !argMem(2, 1) ||
-            !argMem(5, 2) || !arg(6, check) || !argMem(7, 3) ||
-            !argMem(9, 4) || !argMem(10, 5) || !arg(11, capacity)) {
+        const ClUInt prefilter = input.deflatePrefilterEnabled ? 1u : 0u;
+        const ClUInt storeEnabled = input.storeCrcPrefilterEnabled ? 1u : 0u;
+        const ClUInt storeLen = storeEnabled ?
+            static_cast<ClUInt>(input.encryptedStoreData.size()) : 0u;
+        if (!argMem(0, 0) || !argMem(5, 1) || !arg(6, check) ||
+            !argMem(7, 2) || !argMem(10, 3) || !argMem(11, 4) ||
+            !arg(12, capacity) || !argMem(13, 5) || !arg(14, prefilter) ||
+            !argMem(15, 6) || !arg(16, storeLen) ||
+            !arg(17, input.storeExpectedCrc32) || !arg(18, storeEnabled)) {
             reason = "Failed to configure ZipCrypto kernel arguments."; return false;
         }
         return true;
@@ -374,85 +498,103 @@ GpuRunResult runZipCryptoGpu(const ZipCryptoInput& input, const std::string& cha
                              int maxPasswordLength,
                              std::atomic<bool>& stopRequested,
                              std::atomic<std::uint64_t>& triedCount,
-                             const std::function<bool(const std::string&)>& verifyPassword) {
+                             const std::function<bool(GpuCandidateBatch&&)>& submitBatch,
+                             const std::function<bool()>& shouldInterrupt) {
     GpuRunResult result;
     if (charset.empty() || charset.size() > 128 || maxPasswordLength < 1 ||
         maxPasswordLength > 16) {
         result.detail = "Unsupported GPU password alphabet or length.";
         return result;
     }
+    const int maxLow = maxLowDigits(charset.size());
     OpenCl cl;
-    if (!cl.init(result.detail) || !cl.createBuffers(input, charset, result.detail))
+    if (!cl.init(static_cast<ClUInt>(charset.size()), maxLow, result.detail) ||
+        !cl.createBuffers(input, charset, result.detail))
         return result;
     result.deviceName = cl.deviceName;
+    result.deflatePrefilterEnabled = input.deflatePrefilterEnabled;
+    result.storeCrcPrefilterEnabled = input.storeCrcPrefilterEnabled;
+    result.storeCrcBytes = static_cast<std::uint32_t>(input.encryptedStoreData.size());
     std::vector<std::uint32_t> hitOffsets(kMaxHits);
-    std::array<std::uint8_t, 16> prefixBytes{};
 
     for (int len = 1; len <= maxPasswordLength; ++len) {
         const int suffixLen = std::min(len, kMaxGpuSuffix);
         const int prefixLen = len - suffixLen;
         const std::uint64_t prefixCount = powerOf(charset.size(), prefixLen);
         const std::uint64_t suffixCount = powerOf(charset.size(), suffixLen);
-        if (!cl.arg(3, static_cast<ClUInt>(prefixLen)) ||
-            !cl.arg(4, static_cast<ClUInt>(suffixLen))) {
+        const std::uint64_t lowSpan = powerOf(charset.size(), std::min(suffixLen, maxLow));
+        if (!cl.arg(1, static_cast<ClUInt>(suffixLen))) {
             result.detail = "Unable to configure GPU password length.";
             return result;
         }
         for (std::uint64_t p = 0; p < prefixCount; ++p) {
-            if (stopRequested.load(std::memory_order_relaxed)) {
+            if (stopRequested.load(std::memory_order_relaxed) ||
+                (shouldInterrupt && shouldInterrupt())) {
                 result.outcome = GpuRunResult::Outcome::Stopped;
                 return result;
             }
             const std::string prefix = decodeIndex(p, prefixLen, charset);
-            std::copy(prefix.begin(), prefix.end(), prefixBytes.begin());
-            if (!cl.write(1, prefixBytes.data(), prefixBytes.size())) {
-                result.detail = "Failed to write GPU password prefix.";
+            const auto prefixKeys = keysForPrefix(prefix);
+            if (!cl.arg(2, prefixKeys[0]) || !cl.arg(3, prefixKeys[1]) ||
+                !cl.arg(4, prefixKeys[2])) {
+                result.detail = "Failed to configure GPU prefix key state.";
                 return result;
             }
             for (std::uint64_t start = 0; start < suffixCount;) {
-                if (stopRequested.load(std::memory_order_relaxed)) {
+                if (stopRequested.load(std::memory_order_relaxed) ||
+                    (shouldInterrupt && shouldInterrupt())) {
                     result.outcome = GpuRunResult::Outcome::Stopped;
                     return result;
                 }
+                const std::uint64_t lowStart = start % lowSpan;
                 const std::size_t count = static_cast<std::size_t>(
-                    std::min<std::uint64_t>(kBatchSize, suffixCount - start));
-                const ClUInt zero = 0;
-                if (!cl.write(5, &zero, sizeof(zero)) ||
-                    !cl.arg(8, static_cast<ClULong>(start)) ||
+                    std::min({static_cast<std::uint64_t>(kBatchSize),
+                              suffixCount - start, lowSpan - lowStart}));
+                const std::array<ClUInt, 2> zero{{0, 0}};
+                if (!cl.write(4, zero.data(), sizeof(zero)) ||
+                    !cl.arg(8, static_cast<ClUInt>(lowStart)) ||
+                    !cl.arg(9, static_cast<ClUInt>(start / lowSpan)) ||
                     cl.enqueueKernel(cl.queue, cl.kernel, 1, nullptr, &count,
                                      nullptr, 0, nullptr, nullptr) != kSuccess) {
                     result.detail = "OpenCL kernel dispatch failed.";
                     return result;
                 }
-                ClUInt hits = 0;
-                if (!cl.read(5, &hits, sizeof(hits))) {
+                std::array<ClUInt, 2> counters{};
+                if (!cl.read(4, counters.data(), sizeof(counters))) {
                     result.detail = "Unable to retrieve GPU match count.";
                     return result;
                 }
+                const ClUInt hits = counters[0];
+                result.headerPasses += (input.deflatePrefilterEnabled ||
+                                        input.storeCrcPrefilterEnabled) ? counters[1] : hits;
+                result.prefilterPasses += hits;
                 if (hits > kMaxHits) {
                     // Crucial: never drop unverified candidates. Retry on CPU.
                     result.detail = "GPU candidate buffer overflow; retrying on CPU.";
                     return result;
                 }
-                if (hits && !cl.read(4, hitOffsets.data(), hits * sizeof(hitOffsets[0]))) {
+                if (hits && !cl.read(3, hitOffsets.data(), hits * sizeof(hitOffsets[0]))) {
                     result.detail = "Unable to retrieve GPU candidates.";
                     return result;
                 }
                 saturatingAdd(triedCount, count);
-                for (ClUInt i = 0; i < hits; ++i) {
-                    if (stopRequested.load(std::memory_order_relaxed)) {
+                // One submission per GPU batch. The CPU verifies offsets
+                // against the same immutable prefix / suffix alphabet.
+                if (hits) {
+                    GpuCandidateBatch batch;
+                    batch.prefix = prefix;
+                    batch.startIndex = start;
+                    batch.suffixLength = static_cast<std::uint32_t>(suffixLen);
+                    batch.offsets.reserve(hits);
+                    for (ClUInt i = 0; i < hits; ++i) {
+                        if (hitOffsets[i] >= count) {
+                            result.detail = "GPU candidate offset is invalid.";
+                            return result; // Fallback; no silent skip.
+                        }
+                        batch.offsets.push_back(hitOffsets[i]);
+                    }
+                    if (!submitBatch(std::move(batch))) {
                         result.outcome = GpuRunResult::Outcome::Stopped;
-                        return result;
-                    }
-                    if (hitOffsets[i] >= count) {
-                        result.detail = "GPU candidate offset is invalid.";
-                        return result;
-                    }
-                    const std::string password = prefix +
-                        decodeIndex(start + hitOffsets[i], suffixLen, charset);
-                    if (verifyPassword(password)) {
-                        result.outcome = GpuRunResult::Outcome::Found;
-                        result.password = password;
                         return result;
                     }
                 }

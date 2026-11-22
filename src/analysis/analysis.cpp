@@ -5,6 +5,12 @@
 #include "../logger/logger.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -181,18 +187,19 @@ std::string Analysis::run() {
                         std::string reason;
                         if (prepareZipCryptoInput(filePath_, archive.get(), target.index,
                                                   gpuInput, reason)) {
+                            if (!gpuInput.storeCrcPrefilterEnabled &&
+                                !gpuInput.storeCrcSkipReason.empty()) {
+                                Logger::getInstance().log(
+                                    LogLevel::Info, "Store CRC prefilter skipped: " +
+                                    gpuInput.storeCrcSkipReason);
+                            }
                             Logger::getInstance().log(
                                 LogLevel::Info, "Attempting OpenCL GPU analysis: " +
                                 detectedGpu.deviceName);
                             activeBackend.store(2, std::memory_order_release);
-                            const auto verify = [&](const std::string& password) {
-                                return testPassword(archive.get(), target, password, false);
-                            };
-                            const GpuRunResult gpu = runZipCryptoGpu(
-                                gpuInput, charset_, maxPasswordLen_, stopRequested_,
-                                triedCount, verify);
+                            const GpuRunResult gpu = runGpuParallel(gpuInput, target);
                             if (gpu.outcome == GpuRunResult::Outcome::Found) {
-                                saveResult(gpu.password);
+                                // runGpuParallel workers already stored the result safely.
                                 cpuFallback = false;
                             } else if (gpu.outcome == GpuRunResult::Outcome::Completed ||
                                        gpu.outcome == GpuRunResult::Outcome::Stopped) {
@@ -226,7 +233,19 @@ std::string Analysis::run() {
                         triedCount.store(0, std::memory_order_release);
                         activeBackend.store(1, std::memory_order_release);
                         archive.reset(); // CPU threads each create a separate zip_t.
+                        const auto cpuStarted = std::chrono::steady_clock::now();
                         runCpu(target);
+                        const double cpuSeconds = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - cpuStarted).count();
+                        const auto cpuAttempts = triedCount.load(std::memory_order_relaxed);
+                        std::ostringstream cpuProfile;
+                        cpuProfile << std::fixed << std::setprecision(2)
+                                   << "CPU profile: attempts=" << cpuAttempts
+                                   << ", elapsed_s=" << cpuSeconds
+                                   << ", passwords_per_s=" <<
+                                      (cpuSeconds > 0.0 ?
+                                       static_cast<double>(cpuAttempts) / cpuSeconds : 0.0);
+                        Logger::getInstance().log(LogLevel::Info, cpuProfile.str());
                     }
 
                     if (!workerError_.empty()) {
@@ -251,6 +270,239 @@ std::string Analysis::run() {
 
     isRunning.store(false, std::memory_order_release);
     return found.load(std::memory_order_acquire) ? result_ : std::string{};
+}
+
+// Number of verification workers. A 12-worker default suits a 20-thread CPU,
+// but the best setting depends on RAM, storage and libzip performance.
+// Environment variable ZIPANALYSIS_VERIFY_WORKERS accepts 1..32 for A/B tests.
+namespace {
+std::size_t gpuVerificationWorkers() {
+    const auto hw = std::thread::hardware_concurrency();
+    const std::size_t threads = hw ? hw : 8;
+    const std::size_t suggested = std::max<std::size_t>(2, (threads * 3 + 4) / 5);
+    const std::size_t automatic = std::min<std::size_t>(16, suggested);
+    const char* raw = std::getenv("ZIPANALYSIS_VERIFY_WORKERS");
+    if (!raw || !*raw) return automatic;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(raw, &end, 10);
+    if (end == raw || *end != '\0' || parsed < 1 || parsed > 32)
+        return automatic;
+    return static_cast<std::size_t>(parsed);
+}
+}
+
+// GPU produces *compact batches* (offsets into a password range).
+// CPU consumers expand passwords directly into a reusable std::string,
+// avoiding per-candidate allocation and per-candidate queue locks.
+GpuRunResult Analysis::runGpuParallel(const ZipCryptoInput& input,
+                                      const TargetEntry& target) {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    constexpr std::size_t kQueueCandidateCapacity = 16384;
+    const std::size_t workerCount = gpuVerificationWorkers();
+
+    std::deque<GpuCandidateBatch> pending;
+    std::size_t queuedCandidates = 0; // guarded by queueMutex
+    std::mutex queueMutex;
+    std::condition_variable queueNotEmpty;
+    std::condition_variable queueNotFull;
+    std::atomic<bool> workerFailed{false};
+    std::atomic<std::uint64_t> verifications{0};
+    std::atomic<std::uint64_t> workerNs{0};
+    std::atomic<std::uint64_t> producerWaitNs{0};
+    std::atomic<std::uint64_t> completedBatches{0};
+    std::string failureReason;
+    std::size_t peakQueue = 0;
+    bool producerFinished = false; // guarded by queueMutex
+
+    const auto interrupted = [&]() noexcept {
+        return stopRequested_.load(std::memory_order_relaxed) ||
+               found.load(std::memory_order_acquire) ||
+               workerFailed.load(std::memory_order_acquire);
+    };
+    const auto wakeAll = [&]() {
+        queueNotEmpty.notify_all();
+        queueNotFull.notify_all();
+    };
+    const auto fail = [&](const std::string& message) {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (failureReason.empty()) failureReason = message;
+            workerFailed.store(true, std::memory_order_release);
+        }
+        wakeAll();
+    };
+
+    // A whole batch is either enqueued or rejected due to interruption.
+    // No offsets can be silently dropped on a successful GPU completion.
+    const auto submitBatch = [&](GpuCandidateBatch&& batch) -> bool {
+        const std::size_t n = batch.offsets.size();
+        if (!n) return true;
+        if (n > kQueueCandidateCapacity) {
+            fail("GPU batch exceeds candidate queue capacity.");
+            return false;
+        }
+        std::unique_lock<std::mutex> lock(queueMutex);
+        const auto waitStart = Clock::now();
+        while (queuedCandidates > kQueueCandidateCapacity - n && !interrupted()) {
+            // requestStop() can be called without a CV notification.
+            queueNotFull.wait_for(lock, 20ms);
+        }
+        const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - waitStart).count();
+        producerWaitNs.fetch_add(static_cast<std::uint64_t>(waited),
+                                std::memory_order_relaxed);
+        if (interrupted()) return false;
+        pending.push_back(std::move(batch));
+        queuedCandidates += n;
+        peakQueue = std::max(peakQueue, queuedCandidates);
+        lock.unlock();
+        queueNotEmpty.notify_one();
+        return true;
+    };
+
+    const auto verifyWorker = [&]() {
+        try {
+            int errorCode = 0;
+            ZipHandle localArchive(zip_open(filePath_.c_str(), ZIP_RDONLY, &errorCode));
+            if (!localArchive) {
+                fail("GPU verifier could not open ZIP archive (error " +
+                     std::to_string(errorCode) + ").");
+                return;
+            }
+            const std::uint64_t radix = static_cast<std::uint64_t>(charset_.size());
+            // 16 is the maximum GPU candidate password length.
+            std::string password;
+            password.reserve(static_cast<std::size_t>(maxPasswordLen_));
+            std::uint64_t localVerified = 0;
+            std::uint64_t localWorkerNs = 0;
+            std::uint64_t localBatches = 0;
+
+            while (!interrupted()) {
+                GpuCandidateBatch batch;
+                {
+                    std::unique_lock<std::mutex> lock(queueMutex);
+                    queueNotEmpty.wait_for(lock, 20ms, [&] {
+                        return !pending.empty() || producerFinished || interrupted();
+                    });
+                    if (interrupted()) break;
+                    if (pending.empty()) {
+                        if (producerFinished) break;
+                        continue;
+                    }
+                    batch = std::move(pending.front());
+                    pending.pop_front();
+                    queuedCandidates -= batch.offsets.size();
+                }
+                queueNotFull.notify_one();
+
+                const auto batchStarted = Clock::now();
+                const std::size_t prefixLength = batch.prefix.size();
+                const std::size_t passwordLength = prefixLength + batch.suffixLength;
+                password.assign(batch.prefix);
+                password.resize(passwordLength);
+                ++localBatches;
+                for (std::uint32_t offset : batch.offsets) {
+                    if (interrupted()) break;
+                    std::uint64_t index = batch.startIndex + offset;
+                    for (std::size_t i = passwordLength; i > prefixLength;) {
+                        password[--i] = charset_[static_cast<std::size_t>(index % radix)];
+                        index /= radix;
+                    }
+                    ++localVerified;
+                    if (testPassword(localArchive.get(), target, password, false)) {
+                        saveResult(password);
+                        wakeAll();
+                        break;
+                    }
+                }
+                localWorkerNs += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now() - batchStarted).count());
+            }
+            verifications.fetch_add(localVerified, std::memory_order_relaxed);
+            workerNs.fetch_add(localWorkerNs, std::memory_order_relaxed);
+            completedBatches.fetch_add(localBatches, std::memory_order_relaxed);
+        } catch (const std::exception& ex) {
+            fail(std::string("GPU verification worker failed: ") + ex.what());
+        } catch (...) {
+            fail("GPU verification worker failed unexpectedly.");
+        }
+    };
+
+    GpuRunResult gpu;
+    std::vector<std::thread> workers;
+    workers.reserve(workerCount);
+    const auto started = Clock::now();
+    try {
+        for (std::size_t i = 0; i < workerCount; ++i)
+            workers.emplace_back(verifyWorker);
+
+        const auto shouldInterrupt = [&]() {
+            return found.load(std::memory_order_acquire) ||
+                   workerFailed.load(std::memory_order_acquire);
+        };
+        gpu = runZipCryptoGpu(input, charset_, maxPasswordLen_, stopRequested_,
+                              triedCount, submitBatch, shouldInterrupt);
+        if (gpu.outcome == GpuRunResult::Outcome::Fallback)
+            workerFailed.store(true, std::memory_order_release);
+    } catch (const std::exception& ex) {
+        gpu.outcome = GpuRunResult::Outcome::Fallback;
+        gpu.detail = std::string("GPU pipeline failed: ") + ex.what();
+        workerFailed.store(true, std::memory_order_release);
+    } catch (...) {
+        gpu.outcome = GpuRunResult::Outcome::Fallback;
+        gpu.detail = "GPU pipeline failed unexpectedly.";
+        workerFailed.store(true, std::memory_order_release);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        producerFinished = true;
+    }
+    wakeAll();
+    for (auto& workerThread : workers)
+        if (workerThread.joinable()) workerThread.join();
+
+    // Found wins over concurrent Stop/worker error. All threads are joined.
+    if (found.load(std::memory_order_acquire)) {
+        gpu.outcome = GpuRunResult::Outcome::Found;
+        gpu.password = result_;
+        gpu.detail.clear();
+    } else if (stopRequested_.load(std::memory_order_acquire)) {
+        gpu.outcome = GpuRunResult::Outcome::Stopped;
+    } else if (workerFailed.load(std::memory_order_acquire)) {
+        gpu.outcome = GpuRunResult::Outcome::Fallback;
+        if (gpu.detail.empty()) gpu.detail = failureReason.empty()
+            ? "GPU verifier worker failed." : failureReason;
+    }
+
+    const double elapsedS = std::chrono::duration<double>(Clock::now() - started).count();
+    const auto attempts = triedCount.load(std::memory_order_relaxed);
+    const auto verified = verifications.load(std::memory_order_relaxed);
+    std::ostringstream profile;
+    profile << std::fixed << std::setprecision(2)
+            << "GPU batched profile: attempts=" << attempts
+            << ", elapsed_s=" << elapsedS
+            << ", passwords_per_s=" << (elapsedS > 0.0 ? attempts / elapsedS : 0.0)
+            << ", libzip_verifications=" << verified
+            << ", deflate_prefilter=" << (gpu.deflatePrefilterEnabled ? "on" : "off")
+            << ", store_crc_prefilter=" << (gpu.storeCrcPrefilterEnabled ? "on" : "off")
+            << ", store_crc_bytes=" << gpu.storeCrcBytes
+            << ", header_passes=" << gpu.headerPasses
+            << ", gpu_passes=" << gpu.prefilterPasses
+            << ", prefilter_rejected=" <<
+               (gpu.headerPasses >= gpu.prefilterPasses ?
+                gpu.headerPasses - gpu.prefilterPasses : 0)
+            << ", verification_worker_s=" <<
+               (workerNs.load(std::memory_order_relaxed) / 1e9)
+            << ", workers=" << workers.size()
+            << ", batches=" << completedBatches.load(std::memory_order_relaxed)
+            << ", gpu_queue_wait_s=" << (producerWaitNs.load(std::memory_order_relaxed) / 1e9)
+            << ", peak_queue=" << peakQueue
+            << ", outcome=" << static_cast<int>(gpu.outcome);
+    Logger::getInstance().log(LogLevel::Info, profile.str());
+    return gpu;
 }
 
 void Analysis::runCpu(const TargetEntry& target) {

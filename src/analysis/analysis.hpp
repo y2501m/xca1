@@ -8,6 +8,9 @@
 #include <vector>
 #include <zip.h>
 
+struct ZipCryptoInput;
+struct GpuRunResult;
+
 class Analysis {
 public:
     Analysis(std::string filePath, int maxPasswordLen);
@@ -37,6 +40,7 @@ private:
 
     bool selectEncryptedEntry(zip_t* archive, TargetEntry& target, bool preferZipCrypto);
     void initializeProgress();
+    GpuRunResult runGpuParallel(const ZipCryptoInput& input, const TargetEntry& target);
     void runCpu(const TargetEntry& target);
     void worker(const TargetEntry& target,
                 std::atomic<std::size_t>& nextTask,
