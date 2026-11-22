@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
+#include <exception>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -21,6 +22,9 @@ static std::atomic<bool> g_isAnalyzing{false};
 static std::string g_selectedFile;
 static std::string g_dropError;
 static std::string g_resultPassword;
+static std::string g_analysisMessage;
+static std::shared_ptr<Analysis> g_analysis;
+static std::thread g_analysisThread;
 
 void onFileDrop(GLFWwindow* window, int count, const char** paths);
 void drawMainWindow();
@@ -40,6 +44,7 @@ void onFileDrop(GLFWwindow* /*window*/, int count, const char** paths) {
     // 不正なファイルだった場合、以前のファイルパスが残らないようにする。
     g_selectedFile.clear();
     g_resultPassword.clear();
+    g_analysisMessage.clear();
     g_dropError.clear();
 
     if (count != 1 || paths == nullptr || paths[0] == nullptr) {
@@ -156,6 +161,12 @@ int main() {
         glfwSwapBuffers(window);
     }
 
+    // Window closure must not leave a detached brute-force worker running.
+    if (g_analysisThread.joinable()) {
+        if (g_isAnalyzing.load() && g_analysis) g_analysis->requestStop();
+        g_analysisThread.join();
+    }
+
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
@@ -171,7 +182,6 @@ int main() {
  */
 void drawMainWindow() {
     static int maxPasswordLen = 1;
-    static std::shared_ptr<Analysis> analysis;
 
     // ファイルはGLFWのドロップコールバックでウィンドウ全体から受け付ける。
     // 専用のドラッグ＆ドロップ領域は描画しない。
@@ -200,35 +210,54 @@ void drawMainWindow() {
             Logger::getInstance().log(LogLevel::Info,
                                       "Analyzing passwords from file: " + g_selectedFile);
 
-            analysis = std::make_shared<Analysis>(g_selectedFile, maxPasswordLen);
+            // The previous completed thread must be joined before reuse.
+            if (g_analysisThread.joinable()) g_analysisThread.join();
+            g_analysis = std::make_shared<Analysis>(g_selectedFile, maxPasswordLen);
             g_resultPassword.clear();
-            g_isAnalyzing.store(true);
+            g_analysisMessage.clear();
+            g_isAnalyzing.store(true, std::memory_order_release);
 
-            // 解析は従来どおりバックグラウンドで実行する。
-            // shared_ptrで解析オブジェクトの寿命をスレッド終了まで保持する。
-            std::thread([currentAnalysis = analysis]() {
-                g_resultPassword = currentAnalysis->run();
-                g_isAnalyzing.store(false);
-            }).detach();
+            try {
+                g_analysisThread = std::thread([currentAnalysis = g_analysis]() {
+                    try {
+                        g_resultPassword = currentAnalysis->run();
+                        g_analysisMessage = currentAnalysis->statusMessage();
+                    } catch (const std::exception& ex) {
+                        g_analysisMessage = std::string("Analysis error: ") + ex.what();
+                    } catch (...) {
+                        g_analysisMessage = "An unexpected analysis error occurred.";
+                    }
+                    // Publish the result/message after every write has finished.
+                    g_isAnalyzing.store(false, std::memory_order_release);
+                });
+            } catch (const std::exception& ex) {
+                g_isAnalyzing.store(false, std::memory_order_release);
+                g_analysisMessage = std::string("Unable to start analysis: ") + ex.what();
+            }
         }
         ImGui::EndDisabled();
     }
 
-    if (g_isAnalyzing.load() && analysis) {
-        ImGui::TextUnformatted("Analyzing password...");
+    if (g_isAnalyzing.load(std::memory_order_acquire) && g_analysis) {
+        const int backend = g_analysis->activeBackend.load(std::memory_order_acquire);
+        const char* backendLabel = backend == 2 ? "GPU" : (backend == 1 ? "CPU" : "Detecting");
+        ImGui::Text("Analyzing password... (%s)", backendLabel);
         ImGui::SameLine();
         Spinner("##spinner", 8.0f, 3);
 
-        const uint64_t tried = analysis->triedCount.load();
-        const uint64_t total = analysis->totalCount;
-        const float progress = total > 0
-            ? static_cast<float>(tried) / static_cast<float>(total)
-            : 0.0f;
+        const std::uint64_t tried = g_analysis->triedCount.load();
+        const double total = g_analysis->totalCountEstimate.load();
+        const double ratio = total > 0.0 ? static_cast<double>(tried) / total : 0.0;
+        const float progress = static_cast<float>(std::clamp(ratio, 0.0, 1.0));
         ImGui::ProgressBar(progress, ImVec2(-1, 0));
     }
 
-    if (!g_isAnalyzing.load() && !g_resultPassword.empty()) {
-        drawCenteredBigPassword(g_resultPassword);
+    if (!g_isAnalyzing.load(std::memory_order_acquire)) {
+        if (!g_resultPassword.empty()) {
+            drawCenteredBigPassword(g_resultPassword);
+        } else if (!g_analysisMessage.empty()) {
+            ImGui::TextWrapped("%s", g_analysisMessage.c_str());
+        }
     }
 }
 

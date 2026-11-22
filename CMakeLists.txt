@@ -12,6 +12,9 @@ set(SOURCES
     src/main.cpp
     src/logger/logger.cpp
     src/analysis/analysis.cpp
+    src/gpu/gpu_detector.cpp
+    src/gpu/gpu_analysis.cpp
+    src/gpu/zipcrypto_input.cpp
     external/glad/src/glad.c
     external/imgui/imgui.cpp
     external/imgui/imgui_draw.cpp
