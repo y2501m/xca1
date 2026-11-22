@@ -176,7 +176,6 @@ void drawMainWindow() {
     // ファイルはGLFWのドロップコールバックでウィンドウ全体から受け付ける。
     // 専用のドラッグ＆ドロップ領域は描画しない。
     ImGui::TextUnformatted("Drop a ZIP file anywhere in this window");
-    ImGui::Spacing();
 
     // 最大パスワード長
     ImGui::BeginDisabled(g_isAnalyzing.load());
