@@ -19,13 +19,11 @@ set(SOURCES
     external/imgui/imgui_widgets.cpp
     external/imgui/backends/imgui_impl_glfw.cpp
     external/imgui/backends/imgui_impl_opengl3.cpp
-    external/ImGuiFileDialog/ImGuiFileDialog.cpp
 )
 
 # パッケージ検出
 find_package(glfw3 CONFIG REQUIRED)
 find_package(libzip CONFIG REQUIRED)
-find_package(OpenGL REQUIRED)
 
 # 実行ファイル
 add_executable(${PROJECT_NAME} ${SOURCES})
@@ -41,13 +39,10 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     external/glad/include
     external/imgui
     external/imgui/backends
-    external/ImGuiFileDialog
 )
 
 # ライブラリーリンク
 target_link_libraries(${PROJECT_NAME} PRIVATE
     glfw
     libzip::zip
-    OpenGL::GL
-    gdi32
 )
