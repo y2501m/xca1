@@ -182,6 +182,7 @@ int main() {
  */
 void drawMainWindow() {
     static int maxPasswordLen = 1;
+    static bool cancelRequested = false;
 
     // ファイルはGLFWのドロップコールバックでウィンドウ全体から受け付ける。
     // 専用のドラッグ＆ドロップ領域は描画しない。
@@ -205,6 +206,7 @@ void drawMainWindow() {
     if (!g_selectedFile.empty() &&
         !g_isAnalyzing.load(std::memory_order_acquire)) {
         if (ImGui::Button("Analyze Passwords")) {
+            cancelRequested = false;
             // 解析を開始できたら、以前のドロップエラーを非表示にする。
             g_dropError.clear();
             Logger::getInstance().log(LogLevel::Info,
@@ -244,6 +246,18 @@ void drawMainWindow() {
         ImGui::SameLine();
         Spinner("##spinner", 8.0f, 3);
 
+        // キャンセルボタンはスピナーの右横に配置する。
+        // 停止要求後は無効化し、メッセージは追加表示しない。
+        ImGui::SameLine();
+        ImGui::BeginDisabled(cancelRequested);
+        if (ImGui::Button("Cancel")) {
+            cancelRequested = true;
+            g_analysis->requestStop();
+            Logger::getInstance().log(LogLevel::Info,
+                                      "Analysis cancellation requested.");
+        }
+        ImGui::EndDisabled();
+
         const std::uint64_t tried = g_analysis->triedCount.load();
         const double total = g_analysis->totalCountEstimate.load();
         const double ratio = total > 0.0 ? static_cast<double>(tried) / total : 0.0;
@@ -254,7 +268,8 @@ void drawMainWindow() {
     if (!g_isAnalyzing.load(std::memory_order_acquire)) {
         if (!g_resultPassword.empty()) {
             drawCenteredBigPassword(g_resultPassword);
-        } else if (!g_analysisMessage.empty()) {
+        } else if (!cancelRequested && !g_analysisMessage.empty()) {
+            // ユーザーがキャンセルした場合、完了メッセージは表示しない。
             ImGui::TextWrapped("%s", g_analysisMessage.c_str());
         }
     }
