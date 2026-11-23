@@ -201,9 +201,9 @@ void drawMainWindow() {
                            "%s", g_dropError.c_str());
     }
 
-    // ZIPが選択された後だけ解析ボタンを表示する。
-    if (!g_selectedFile.empty()) {
-        ImGui::BeginDisabled(g_isAnalyzing.load());
+    // ZIPが選択されていて、解析中でない場合だけ解析ボタンを表示する。
+    if (!g_selectedFile.empty() &&
+        !g_isAnalyzing.load(std::memory_order_acquire)) {
         if (ImGui::Button("Analyze Passwords")) {
             // 解析を開始できたら、以前のドロップエラーを非表示にする。
             g_dropError.clear();
@@ -235,7 +235,6 @@ void drawMainWindow() {
                 g_analysisMessage = std::string("Unable to start analysis: ") + ex.what();
             }
         }
-        ImGui::EndDisabled();
     }
 
     if (g_isAnalyzing.load(std::memory_order_acquire) && g_analysis) {
