@@ -46,6 +46,9 @@ void onFileDrop(GLFWwindow* /*window*/, int count, const char** paths) {
     g_resultPassword.clear();
     g_analysisMessage.clear();
     g_dropError.clear();
+    // 以前のZIPの未確定候補が、新しくドロップしたZIPに残らないようにする。
+    // g_isAnalyzingがfalseになってから呼ばれるため、前回の処理は完了済み。
+    g_analysis.reset();
 
     if (count != 1 || paths == nullptr || paths[0] == nullptr) {
         g_dropError = "Please drop exactly one ZIP file.";
@@ -258,19 +261,50 @@ void drawMainWindow() {
         }
         ImGui::EndDisabled();
 
-        const std::uint64_t tried = g_analysis->triedCount.load();
-        const double total = g_analysis->totalCountEstimate.load();
-        const double ratio = total > 0.0 ? static_cast<double>(tried) / total : 0.0;
+        // 16桁の探索件数はuint64_tを超えるため、GPU/CPUが更新する
+        // double型の進捗推定値を使用する（triedCountは64bitで飽和する）。
+        const double completed = g_analysis->completedCountEstimate.load(
+            std::memory_order_acquire);
+        const double total = g_analysis->totalCountEstimate.load(
+            std::memory_order_acquire);
+        const double ratio = total > 0.0 ? completed / total : 0.0;
         const float progress = static_cast<float>(std::clamp(ratio, 0.0, 1.0));
         ImGui::ProgressBar(progress, ImVec2(-1, 0));
     }
 
-    if (!g_isAnalyzing.load(std::memory_order_acquire)) {
+    const bool analyzing = g_isAnalyzing.load(std::memory_order_acquire);
+    if (!analyzing) {
         if (!g_resultPassword.empty()) {
             drawCenteredBigPassword(g_resultPassword);
         } else if (!cancelRequested && !g_analysisMessage.empty()) {
             // ユーザーがキャンセルした場合、完了メッセージは表示しない。
             ImGui::TextWrapped("%s", g_analysisMessage.c_str());
+        }
+    }
+
+    // 未確定候補は解析中・解析終了後の両方で表示する。
+    // キャンセル直後は、以前の要望どおりメッセージを追加しない。
+    // 全候補は解析エンジンがファイルへ保存し、UIでは先頭最大10件だけ表示する。
+    if (g_analysis && !cancelRequested && (analyzing || g_resultPassword.empty())) {
+        const auto candidates = g_analysis->candidateSnapshot();
+        if (candidates.total > 0) {
+            ImGui::Separator();
+            ImGui::TextColored(
+                ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                "Unconfirmed password candidates: %llu%s",
+                static_cast<unsigned long long>(candidates.total),
+                analyzing ? " (search continues)" : "");
+            ImGui::TextWrapped(
+                "Warning: these matches may be CRC32 collisions. "
+                "They are NOT confirmed passwords.");
+            for (const auto& password : candidates.passwords) {
+                ImGui::BulletText("%s", password.c_str());
+            }
+            if (!candidates.journalPath.empty()) {
+                ImGui::TextWrapped("Candidate file: %s", candidates.journalPath.c_str());
+                ImGui::TextWrapped("The file contains plaintext password candidates. "
+                                   "Keep it private.");
+            }
         }
     }
 }

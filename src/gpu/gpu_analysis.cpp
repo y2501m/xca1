@@ -492,6 +492,10 @@ void saturatingAdd(std::atomic<std::uint64_t>& target, std::uint64_t increment) 
         if (target.compare_exchange_weak(previous, next, std::memory_order_relaxed)) break;
     }
 }
+void saturatingAccumulate(std::uint64_t& target, std::uint64_t increment) {
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    target = (increment > maximum - target) ? maximum : target + increment;
+}
 } // namespace
 
 GpuRunResult runZipCryptoGpu(const ZipCryptoInput& input, const std::string& charset,
@@ -499,7 +503,8 @@ GpuRunResult runZipCryptoGpu(const ZipCryptoInput& input, const std::string& cha
                              std::atomic<bool>& stopRequested,
                              std::atomic<std::uint64_t>& triedCount,
                              const std::function<bool(GpuCandidateBatch&&)>& submitBatch,
-                             const std::function<bool()>& shouldInterrupt) {
+                             const std::function<bool()>& shouldInterrupt,
+                             const std::function<void(double)>& reportCompleted) {
     GpuRunResult result;
     if (charset.empty() || charset.size() > 128 || maxPasswordLength < 1 ||
         maxPasswordLength > 16) {
@@ -516,8 +521,11 @@ GpuRunResult runZipCryptoGpu(const ZipCryptoInput& input, const std::string& cha
     result.storeCrcPrefilterEnabled = input.storeCrcPrefilterEnabled;
     result.storeCrcBytes = static_cast<std::uint32_t>(input.encryptedStoreData.size());
     std::vector<std::uint32_t> hitOffsets(kMaxHits);
+    double completedShorterLengths = 0.0;
+    double combinationsThisLength = 1.0;
 
     for (int len = 1; len <= maxPasswordLength; ++len) {
+        combinationsThisLength *= static_cast<double>(charset.size());
         const int suffixLen = std::min(len, kMaxGpuSuffix);
         const int prefixLen = len - suffixLen;
         const std::uint64_t prefixCount = powerOf(charset.size(), prefixLen);
@@ -565,9 +573,10 @@ GpuRunResult runZipCryptoGpu(const ZipCryptoInput& input, const std::string& cha
                     return result;
                 }
                 const ClUInt hits = counters[0];
-                result.headerPasses += (input.deflatePrefilterEnabled ||
-                                        input.storeCrcPrefilterEnabled) ? counters[1] : hits;
-                result.prefilterPasses += hits;
+                saturatingAccumulate(result.headerPasses,
+                    (input.deflatePrefilterEnabled ||
+                     input.storeCrcPrefilterEnabled) ? counters[1] : hits);
+                saturatingAccumulate(result.prefilterPasses, hits);
                 if (hits > kMaxHits) {
                     // Crucial: never drop unverified candidates. Retry on CPU.
                     result.detail = "GPU candidate buffer overflow; retrying on CPU.";
@@ -578,6 +587,14 @@ GpuRunResult runZipCryptoGpu(const ZipCryptoInput& input, const std::string& cha
                     return result;
                 }
                 saturatingAdd(triedCount, count);
+                // Report *absolute* work, not 524288-sized additions to a
+                // double counter. At 16 characters, a relative tiny increment
+                // can round to zero; an absolute value remains accurate enough.
+                if (reportCompleted) {
+                    reportCompleted(completedShorterLengths +
+                        static_cast<double>(p) * static_cast<double>(suffixCount) +
+                        static_cast<double>(start + count));
+                }
                 // One submission per GPU batch. The CPU verifies offsets
                 // against the same immutable prefix / suffix alphabet.
                 if (hits) {
@@ -601,6 +618,7 @@ GpuRunResult runZipCryptoGpu(const ZipCryptoInput& input, const std::string& cha
                 start += count;
             }
         }
+        completedShorterLengths += combinationsThisLength;
     }
     result.outcome = GpuRunResult::Outcome::Completed;
     return result;

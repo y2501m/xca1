@@ -13,6 +13,8 @@
 #include <sstream>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -26,6 +28,18 @@ struct ZipDeleter {
     }
 };
 using ZipHandle = std::unique_ptr<zip_t, ZipDeleter>;
+
+// Only encrypted regular files can independently confirm a ZIP password.
+bool isEncryptedRegularEntry(const zip_stat_t& stat) {
+    if (!(stat.valid & ZIP_STAT_ENCRYPTION_METHOD) ||
+        stat.encryption_method == ZIP_EM_NONE) return false;
+    if ((stat.valid & ZIP_STAT_NAME) && stat.name) {
+        const std::size_t n = std::strlen(stat.name);
+        if (n && stat.name[n - 1] == '/') return false;
+    }
+    return true;
+}
+
 } // namespace
 
 Analysis::Analysis(std::string filePath, int maxPasswordLen)
@@ -44,6 +58,7 @@ void Analysis::initializeProgress() {
     triedCount.store(0, std::memory_order_relaxed);
     totalCount.store(0, std::memory_order_relaxed);
     totalCountEstimate.store(0.0, std::memory_order_relaxed);
+    completedCountEstimate.store(0.0, std::memory_order_relaxed);
 
     const std::uint64_t base = static_cast<std::uint64_t>(charset_.size());
     std::uint64_t power = 1;
@@ -159,11 +174,17 @@ std::string Analysis::run() {
     result_.clear();
     statusMessage_.clear();
     workerError_.clear();
+    {
+        std::lock_guard<std::mutex> lock(resultMutex_);
+        candidateCount_ = 0;
+        candidatePasswords_.clear();
+        candidateJournalPath_.clear();
+    }
     initializeProgress();
 
     try {
-        if (maxPasswordLen_ < 1 || charset_.empty()) {
-            statusMessage_ = "Invalid password length or character set.";
+        if (maxPasswordLen_ < 1 || maxPasswordLen_ > 16 || charset_.empty()) {
+            statusMessage_ = "Password length must be in the range 1..16.";
         } else {
             int errorCode = 0;
             ZipHandle archive(zip_open(filePath_.c_str(), ZIP_RDONLY, &errorCode));
@@ -179,6 +200,16 @@ std::string Analysis::run() {
                         "Selected encrypted ZIP entry index: " +
                             std::to_string(target.index));
 
+                    // All potentially valid ZipCrypto passwords are journaled when
+                    // they cannot be independently confirmed. Do not impose a 10-
+                    // candidate cap on the actual results. Failed journal creation
+                    // aborts instead of silently discarding candidate passwords.
+                    if (target.encryptionMethod == ZIP_EM_TRAD_PKWARE &&
+                        !openCandidateJournal()) {
+                        statusMessage_ = workerError_;
+                        isRunning.store(false, std::memory_order_release);
+                        return {};
+                    }
                     bool cpuFallback = true;
                     if (detectedGpu.available &&
                         target.encryptionMethod == ZIP_EM_TRAD_PKWARE &&
@@ -231,6 +262,7 @@ std::string Analysis::run() {
                     if (cpuFallback && !stopRequested_.load(std::memory_order_relaxed)) {
                         // A failed partial GPU run must restart the entire search on CPU.
                         triedCount.store(0, std::memory_order_release);
+                        completedCountEstimate.store(0.0, std::memory_order_release);
                         activeBackend.store(1, std::memory_order_release);
                         archive.reset(); // CPU threads each create a separate zip_t.
                         const auto cpuStarted = std::chrono::steady_clock::now();
@@ -250,12 +282,36 @@ std::string Analysis::run() {
 
                     if (!workerError_.empty()) {
                         statusMessage_ = workerError_;
+                        const auto snapshot = candidateSnapshot();
+                        if (!snapshot.journalPath.empty())
+                            statusMessage_ += "\nSaved candidate list: " +
+                                              snapshot.journalPath;
                     } else if (found.load(std::memory_order_acquire)) {
-                        statusMessage_ = "Password found.";
-                    } else if (stopRequested_.load(std::memory_order_acquire)) {
-                        statusMessage_ = "Analysis stopped.";
+                        statusMessage_ = "Password found (verified).";
                     } else {
-                        statusMessage_ = "Password not found within the selected length.";
+                        const CandidateSnapshot candidates = candidateSnapshot();
+                        const bool stopped =
+                            stopRequested_.load(std::memory_order_acquire);
+                        if (candidates.total != 0) {
+                            std::ostringstream message;
+                            message << (stopped ? "Analysis stopped. " : "Analysis completed. ")
+                                    << "Unconfirmed password candidates: "
+                                    << candidates.total
+                                    << ". These are NOT guaranteed correct passwords.";
+                            if (!candidates.passwords.empty()) {
+                                message << "\nFirst " << candidates.passwords.size()
+                                        << " candidate(s):";
+                                for (const auto& password : candidates.passwords)
+                                    message << "\n  " << password;
+                            }
+                            message << "\nComplete candidate list (plaintext): "
+                                    << candidates.journalPath;
+                            statusMessage_ = message.str();
+                        } else if (stopped) {
+                            statusMessage_ = "Analysis stopped. No password candidates found.";
+                        } else {
+                            statusMessage_ = "Password not found within the selected length.";
+                        }
                     }
                 }
             }
@@ -410,8 +466,11 @@ GpuRunResult Analysis::runGpuParallel(const ZipCryptoInput& input,
                         index /= radix;
                     }
                     ++localVerified;
-                    if (testPassword(localArchive.get(), target, password, false)) {
-                        saveResult(password);
+                    const auto check = checkPassword(
+                        localArchive.get(), target, password, false);
+                    handleCheckResult(password, check);
+                    if (found.load(std::memory_order_acquire) ||
+                        stopRequested_.load(std::memory_order_relaxed)) {
                         wakeAll();
                         break;
                     }
@@ -442,8 +501,12 @@ GpuRunResult Analysis::runGpuParallel(const ZipCryptoInput& input,
             return found.load(std::memory_order_acquire) ||
                    workerFailed.load(std::memory_order_acquire);
         };
+        const auto reportCompleted = [&](double completed) {
+            completedCountEstimate.store(completed, std::memory_order_release);
+        };
         gpu = runZipCryptoGpu(input, charset_, maxPasswordLen_, stopRequested_,
-                              triedCount, submitBatch, shouldInterrupt);
+                              triedCount, submitBatch, shouldInterrupt,
+                              reportCompleted);
         if (gpu.outcome == GpuRunResult::Outcome::Fallback)
             workerFailed.store(true, std::memory_order_release);
     } catch (const std::exception& ex) {
@@ -557,10 +620,9 @@ void Analysis::worker(const TargetEntry& target,
 
         if (task < alphabetSize) {
             attempt.assign(1, charset_[task]);
-            if (testPassword(archive.get(), target, attempt)) {
-                saveResult(attempt);
-                return;
-            }
+            const auto check = checkPassword(archive.get(), target, attempt);
+            handleCheckResult(attempt, check);
+            if (found.load(std::memory_order_acquire) || shouldStop()) return;
             continue;
         }
 
@@ -580,11 +642,9 @@ bool Analysis::search(zip_t* archive, const TargetEntry& target,
     if (shouldStop()) return true;
 
     if (remainingDigits == 0) {
-        if (testPassword(archive, target, attempt)) {
-            saveResult(attempt);
-            return true;
-        }
-        return false;
+        const auto check = checkPassword(archive, target, attempt);
+        handleCheckResult(attempt, check);
+        return found.load(std::memory_order_acquire) || shouldStop();
     }
 
     for (char c : charset_) {
@@ -597,40 +657,89 @@ bool Analysis::search(zip_t* archive, const TargetEntry& target,
     return false;
 }
 
-bool Analysis::testPassword(zip_t* archive, const TargetEntry& target,
-                            const std::string& password, bool countAttempt) {
-    if (shouldStop()) return false;
-    if (countAttempt) triedCount.fetch_add(1, std::memory_order_relaxed);
+void Analysis::addCpuAttempt() {
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    auto old = triedCount.load(std::memory_order_relaxed);
+    while (old != maximum &&
+           !triedCount.compare_exchange_weak(old, old + 1,
+                                            std::memory_order_relaxed)) {}
+    auto estimate = completedCountEstimate.load(std::memory_order_relaxed);
+    while (!completedCountEstimate.compare_exchange_weak(
+        estimate, estimate + 1.0, std::memory_order_relaxed)) {}
+}
 
-    zip_file_t* file = zip_fopen_index_encrypted(
-        archive, target.index, 0, password.c_str());
-    if (!file) return false;
+Analysis::CheckResult Analysis::checkPassword(
+    zip_t* archive, const TargetEntry& target,
+    const std::string& password, bool countAttempt) {
+    if (shouldStop()) return CheckResult::Rejected;
+    if (countAttempt) addCpuAttempt();
 
-    char buffer[8192];
-    zip_uint64_t bytesRead = 0;
-    bool valid = true;
-    for (;;) {
-        if (shouldStop()) {
-            valid = false;
+    // Full extraction, including EOF and CRC/authentication verification.
+    const auto verifyEntry = [&](zip_uint64_t index, zip_uint64_t expectedSize,
+                                 bool sizeKnown) -> bool {
+        if (shouldStop()) return false;
+        zip_file_t* file = zip_fopen_index_encrypted(
+            archive, index, 0, password.c_str());
+        if (!file) return false;
+        char buffer[8192];
+        zip_uint64_t bytesRead = 0;
+        bool valid = true;
+        for (;;) {
+            if (shouldStop()) { valid = false; break; }
+            const zip_int64_t n = zip_fread(file, buffer, sizeof(buffer));
+            if (n < 0) { valid = false; break; }
+            if (n == 0) break;
+            bytesRead += static_cast<zip_uint64_t>(n);
+            if (sizeKnown && bytesRead > expectedSize) { valid = false; break; }
+        }
+        if (sizeKnown && bytesRead != expectedSize) valid = false;
+        if (zip_fclose(file) != 0) valid = false;
+        return valid && !shouldStop();
+    };
+
+    if (!verifyEntry(target.index, target.uncompressedSize, target.sizeKnown))
+        return CheckResult::Rejected;
+
+    // Authenticated AES entries can be confirmed by libzip alone.
+    if (target.encryptionMethod != ZIP_EM_TRAD_PKWARE)
+        return CheckResult::Confirmed;
+
+    // ZipCrypto is weak: a primary-entry header+CRC32 match is only a
+    // provisional candidate. Cross-check against other encrypted entries.
+    // If another entry has a different password (or cannot be verified),
+    // *keep* this primary match as a candidate; never silently discard it.
+    bool hasIndependentMatch = false;
+    bool allOtherEncryptedMatched = true;
+    const zip_int64_t entries = zip_get_num_entries(archive, 0);
+    if (entries <= 0) return CheckResult::Unconfirmed;
+    for (zip_uint64_t i = 0; i < static_cast<zip_uint64_t>(entries); ++i) {
+        if (i == target.index) continue;
+        zip_stat_t stat;
+        zip_stat_init(&stat);
+        if (zip_stat_index(archive, i, 0, &stat) != 0) {
+            allOtherEncryptedMatched = false;
+            continue;
+        }
+        if (!isEncryptedRegularEntry(stat)) continue;
+        if (!zip_encryption_method_supported(
+                static_cast<zip_int16_t>(stat.encryption_method), 1) ||
+            !(stat.valid & ZIP_STAT_COMP_METHOD) ||
+            !zip_compression_method_supported(
+                static_cast<zip_int32_t>(stat.comp_method), 1)) {
+            allOtherEncryptedMatched = false;
+            continue;
+        }
+        const bool sizeKnown = (stat.valid & ZIP_STAT_SIZE) != 0;
+        if (!verifyEntry(i, sizeKnown ? stat.size : 0, sizeKnown)) {
+            allOtherEncryptedMatched = false;
             break;
         }
-        const zip_int64_t n = zip_fread(file, buffer, sizeof(buffer));
-        if (n < 0) {
-            valid = false;
-            break;
-        }
-        if (n == 0) break; // Reaching EOF lets libzip validate the checksum.
-
-        bytesRead += static_cast<zip_uint64_t>(n);
-        if (target.sizeKnown && bytesRead > target.uncompressedSize) {
-            valid = false;
-            break;
-        }
+        if (sizeKnown && stat.size >= 4)
+            hasIndependentMatch = true;
     }
-
-    if (target.sizeKnown && bytesRead != target.uncompressedSize) valid = false;
-    if (zip_fclose(file) != 0) valid = false;
-    return valid && !shouldStop();
+    if (shouldStop()) return CheckResult::Rejected;
+    return hasIndependentMatch && allOtherEncryptedMatched
+        ? CheckResult::Confirmed : CheckResult::Unconfirmed;
 }
 
 void Analysis::saveResult(const std::string& candidate) {
@@ -640,4 +749,89 @@ void Analysis::saveResult(const std::string& candidate) {
         result_ = candidate;
         found.store(true, std::memory_order_release);
     }
+}
+
+void Analysis::handleCheckResult(const std::string& password,
+                                 CheckResult result) {
+    if (result == CheckResult::Confirmed) saveResult(password);
+    else if (result == CheckResult::Unconfirmed) recordCandidate(password);
+}
+
+void Analysis::setFailure(const std::string& error) {
+    {
+        std::lock_guard<std::mutex> lock(workerErrorMutex_);
+        if (workerError_.empty()) workerError_ = error;
+    }
+    requestStop();
+}
+
+bool Analysis::openCandidateJournal() {
+    try {
+        const auto tick = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::filesystem::path zipPath = std::filesystem::u8path(filePath_);
+        // Each run gets its own file, so previous candidate files are preserved.
+        for (int suffix = 0; suffix < 1000; ++suffix) {
+            std::filesystem::path journalPath = zipPath;
+            journalPath += ".candidates." + std::to_string(tick) + "." +
+                           std::to_string(suffix) + ".txt";
+            if (std::filesystem::exists(journalPath)) continue;
+            candidateJournal_.open(journalPath, std::ios::out | std::ios::binary);
+            if (!candidateJournal_) break;
+            candidateJournal_ << "# Unconfirmed ZipCrypto candidates; "
+                                 "NOT guaranteed to be correct.\n";
+            candidateJournal_.flush();
+            if (!candidateJournal_.good()) break;
+            {
+                std::lock_guard<std::mutex> lock(resultMutex_);
+                candidateJournalPath_ = journalPath.u8string();
+            }
+            Logger::getInstance().log(
+                LogLevel::Info, "Candidate journal: " + journalPath.u8string());
+            return true;
+        }
+    } catch (const std::exception& ex) {
+        setFailure(std::string("Cannot create candidate journal: ") + ex.what());
+        return false;
+    }
+    setFailure("Cannot create candidate journal beside the ZIP. "
+               "Move the ZIP to a writable directory and retry.");
+    return false;
+}
+
+void Analysis::recordCandidate(const std::string& password) {
+    if (shouldStop()) return;
+    bool writeFailed = false;
+    {
+        std::lock_guard<std::mutex> lock(resultMutex_);
+        try {
+            if (!candidateJournal_.is_open()) {
+                writeFailed = true;
+            } else {
+                // Stream directly to disk: there is no cap on candidate records.
+                // If the file fills up, stop the search rather than dropping hits.
+                candidateJournal_ << password << '\n';
+                candidateJournal_.flush();
+                writeFailed = !candidateJournal_.good();
+            }
+            if (!writeFailed) {
+                if (candidateCount_ != std::numeric_limits<std::uint64_t>::max())
+                    ++candidateCount_;
+                if (candidatePasswords_.size() < kMaxSavedCandidates &&
+                    std::find(candidatePasswords_.begin(), candidatePasswords_.end(),
+                              password) == candidatePasswords_.end())
+                    candidatePasswords_.push_back(password);
+            }
+        } catch (const std::exception&) {
+            writeFailed = true;
+        }
+    }
+    if (writeFailed) setFailure("Could not write a candidate to disk; "
+                                "analysis stopped to prevent silent candidate loss.");
+}
+
+Analysis::CandidateSnapshot Analysis::candidateSnapshot() const {
+    std::lock_guard<std::mutex> lock(resultMutex_);
+    return CandidateSnapshot{candidateCount_, candidatePasswords_,
+                             candidateJournalPath_};
 }
